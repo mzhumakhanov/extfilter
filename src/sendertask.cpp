@@ -18,15 +18,15 @@
 */
 
 #include "sendertask.h"
-
 #include "sender.h"
+#include <rte_cycles.h>
 
 Poco::NotificationQueue SenderTask::queue;
 
-SenderTask::SenderTask(struct CSender::params &prm, int instance):
-	Task("SenderTask"),
-	sender(new CSender(prm)),
-	_logger(Poco::Logger::get("SenderTask"+std::to_string(instance)))
+SenderTask::SenderTask(BSender *snd, int instance):
+	Task("SenderTask-"+std::to_string(instance)),
+	sender(snd),
+	_logger(Poco::Logger::get("SenderTask-"+std::to_string(instance)))
 {
 
 }
@@ -40,19 +40,20 @@ SenderTask::~SenderTask()
 void SenderTask::runTask()
 {
 	_logger.debug("Starting SenderTask...");
-
+	pthread_t tid = pthread_self();
+	pthread_setname_np(tid, name().c_str());
 	while(!isCancelled())
 	{
 		Poco::Notification::Ptr pNf(queue.waitDequeueNotification());
 		if (pNf)
 		{
-			RedirectNotification::Ptr pRedirectNf = pNf.cast<RedirectNotification>();
+			RedirectNotificationG::Ptr pRedirectNf = pNf.cast<RedirectNotificationG>();
 			if (pRedirectNf)
 			{
 				if(pRedirectNf->is_rst())
-					sender->SendRST(pRedirectNf->user_port(), pRedirectNf->dst_port(),pRedirectNf->user_ip(),pRedirectNf->dst_ip(), pRedirectNf->acknum(), pRedirectNf->seqnum(), pRedirectNf->f_psh());
+					sender->SendRST(pRedirectNf->user_port(), pRedirectNf->dst_port(),pRedirectNf->user_ip(),pRedirectNf->dst_ip(), pRedirectNf->ip_version(), pRedirectNf->acknum(), pRedirectNf->seqnum(), pRedirectNf->f_psh());
 				else
-					sender->Redirect(pRedirectNf->user_port(), pRedirectNf->dst_port(),pRedirectNf->user_ip(),pRedirectNf->dst_ip(), pRedirectNf->acknum(), pRedirectNf->seqnum(), pRedirectNf->f_psh(), pRedirectNf->additional_param());
+					sender->Redirect(pRedirectNf->user_port(), pRedirectNf->dst_port(),pRedirectNf->user_ip(),pRedirectNf->dst_ip(), pRedirectNf->ip_version(), pRedirectNf->acknum(), pRedirectNf->seqnum(), pRedirectNf->f_psh(), pRedirectNf->additional_param().c_str());
 			}
 		}
 	}

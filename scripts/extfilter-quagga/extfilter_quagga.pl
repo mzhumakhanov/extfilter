@@ -17,7 +17,7 @@ use Net::IP qw(:PROC);
 use Encode;
 use Net::CIDR::Lite;
 use IPC::Open2;
-
+use Fcntl qw(LOCK_EX LOCK_NB);
 
 binmode(STDOUT,':utf8');
 binmode(STDERR,':utf8');
@@ -30,6 +30,25 @@ Log::Log4perl::init( $dir."/extfilter_quagga_log.conf" );
 
 my $logger=Log::Log4perl->get_logger();
 
+my $send_mail = $Config->{'NOTIFY.send_mail'} || 0;
+$send_mail = lc($send_mail);
+my $notify_to = $Config->{'NOTIFY.to'} || "";
+my $notify_from = $Config->{'NOTIFY.from'} || "";
+
+if(!flock(DATA,LOCK_EX|LOCK_NB))
+{
+	$logger->error("Process already running!");
+	print STDERR "Process already running!\n";
+	if(($send_mail eq "1" || $send_mail eq "true") && $notify_to ne "" && $notify_from ne "")
+	{
+		open(MAIL, "|/bin/mail -t");
+		print MAIL "To: $notify_to\n";
+		print MAIL "From: $notify_from\n";
+		print MAIL "Subject: BGP Alert!\n\n";
+		print MAIL "BGP maker process already running! Check it!\n\n";
+	}
+	exit 1;
+}
 
 my $db_host = $Config->{'DB.host'} || die "DB.host not defined.";
 my $db_user = $Config->{'DB.user'} || die "DB.user not defined.";
@@ -45,6 +64,8 @@ my $bgp_neighbor = $Config->{'BGP.neighbor'} || "";
 my $bgp_remote_as = $Config->{'BGP.remote_as'} || "";
 my $bgp6_neighbor = $Config->{'BGP.neighbor6'} || "";
 my $vtysh = $Config->{'BGP.vtysh'} || "/bin/vtysh";
+my $route_to_null = (lc($Config->{'BGP.route_to_null'} || "true")) eq "true" ? 1 : 0;
+my $do_subnets = (lc($Config->{'BGP.do_subnets'} || "true")) eq "true" ? 1 : 0;
 
 my $update_soft_quagga=1;
 
@@ -101,20 +122,37 @@ while (my $ips = $sth->fetchrow_hashref())
 {
 	my $ip=get_ip($ips->{ip});
 	next if($ip eq "0.0.0.0" || $ip eq "0000:0000:0000:0000:0000:0000:0000:0000");
-	next if($ip =~ /89.250.0./);
-	next if($ip eq "5.101.152.126" || $ip eq "5.101.152.140");
-	my $ip_version=ip_get_version($ip);
-	if($ip_version == 4)
+	if($ip =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
 	{
-		$ip_cidr_null->add_any($ip);
+		$ip_cidr_null->add_any($ip) if($route_to_null);
 		$ip_cidr->add_any($ip);
-	} elsif ($ip_version == 6)
+	} else
 	{
-		$ip6_cidr_null->add_any($ip);
+		$ip6_cidr_null->add_any($ip) if($route_to_null);
 		$ip6_cidr->add_any($ip);
 	}
 }
 $sth->finish();
+
+if($do_subnets)
+{
+	$sth = $dbh->prepare("SELECT subnet FROM zap2_subnets");
+	$sth->execute;
+	while (my $ips = $sth->fetchrow_hashref())
+	{
+		my $subnet = $ips->{subnet};
+		if($subnet =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
+		{
+			$ip_cidr_null->add_any($subnet) if($route_to_null);
+			$ip_cidr->add_any($subnet);
+		} else
+		{
+			$ip6_cidr_null->add_any($subnet) if($route_to_null);
+			$ip6_cidr->add_any($subnet);
+		}
+	}
+	$sth->finish();
+}
 
 @ip_list=$ip_cidr->list();
 %ip_s = map { $_ => 1 } @ip_list;
@@ -174,6 +212,7 @@ if(!$update_soft_quagga)
 	}
 }
 
+exit 0;
 
 sub get_md5_sum
 {
@@ -239,7 +278,8 @@ sub analyse_quagga_networks
 			my $ip_p = $ip_a->print();
 			if($ip_version == 4)
 			{
-				 if(defined $ip_s{$ip_p})
+				$ip_p = "$address/$mask";
+				if(defined $ip_s{$ip_p})
 				{
 					delete $ips_to_add{$ip_p};
 				} else {
@@ -255,7 +295,7 @@ sub analyse_quagga_networks
 				}
 			}
 		}
-		if($line =~ /^ip\s+route\s+(.+)\/(\d+)/)
+		if($route_to_null && $line =~ /^ip\s+route\s+(.+)\/(\d+)/)
 		{
 			my $address=$1;
 			my $mask=$2;
@@ -264,6 +304,7 @@ sub analyse_quagga_networks
 			my $ip_p = $ip_a->print();
 			if($ip_version == 4)
 			{
+				$ip_p = "$address/$mask";
 				if(defined $ip_s_null{$ip_p})
 				{
 					delete $ips_to_add_null{$ip_p};
@@ -341,7 +382,10 @@ sub analyse_quagga_networks
 		$outb=<$rdr>;
 		print $wtr "write mem\n";
 		$outb=<$rdr>;
+		print $wtr "exit\n";
+		$outb=<$rdr>;
 		close($wtr);
+		close($rdr);
 
 		waitpid( $pid, 0 );
 		my $child_exit_status = $? >> 8;
@@ -354,3 +398,4 @@ sub analyse_quagga_networks
 	}
 }
 
+__DATA__

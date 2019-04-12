@@ -1,16 +1,37 @@
+/*
+*
+*    Copyright (C) Max <max1976@mail.ru>
+*
+*    This program is free software: you can redistribute it and/or modify
+*    it under the terms of the GNU General Public License as published by
+*    the Free Software Foundation, either version 3 of the License, or
+*    (at your option) any later version.
+*
+*    This program is distributed in the hope that it will be useful,
+*    but WITHOUT ANY WARRANTY; without even the implied warranty of
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*    GNU General Public License for more details.
+*
+*    You should have received a copy of the GNU General Public License
+*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*/
+
 #pragma once
 
 #include <Poco/Util/ServerApplication.h>
 #include <Poco/HashMap.h>
-#include "dtypes.h"
+#include <rte_common.h>
+#include <rte_memory.h>
 #include "sender.h"
-
-#define DEFAULT_MBUF_POOL_SIZE 8191
-#define DEFAULT_RING_SIZE 4096
+#include "worker.h"
+#include "notification.h"
+#include "tries.h"
 
 
 class AhoCorasickPlus;
 class Patricia;
+class ACL;
 
 class extFilter: public Poco::Util::ServerApplication
 {
@@ -23,38 +44,16 @@ public:
 	void uninitialize();
 	void defineOptions(Poco::Util::OptionSet& options);
 	void handleOption(const std::string& name,const std::string& value);
+	void handleVersion(const std::string& name,const std::string& value);
 	void handleHelp(const std::string& name,const std::string& value);
 	void displayHelp();
+
+	void initParams();
+	void initFlowsIPv4();
 
 	/// Print DPDK ports
 	void printDPDKPorts(const std::string& name,const std::string& value);
 	int main(const ArgVec& args);
-
-	/**
-	    Load domains for blocking.
-	**/
-	void loadDomains(std::string &fn, AhoCorasickPlus *_dm_atm,DomainsMatchType *_dm_map);
-
-	/**
-	    Load URLs for blocking.
-	**/
-	void loadURLs(std::string &fn, AhoCorasickPlus *dm_atm);
-
-	/**
-	    Load IP SSL for blocking.
-	**/
-	void loadSSLIP(const std::string &fn, Patricia *patricia);
-
-	/**
-	    Load IP:port for blocking.
-	**/
-	void loadHosts(std::string &fn, IPPortMap *ippm, Patricia *patricia);
-
-
-	/**
-	    Load domains and urls into one database.
-	**/
-	void loadDomainsURLs(std::string &domains, std::string &urls, AhoCorasickPlus *dm_atm, EntriesData *ed);
 
 	std::string &getSSLFile()
 	{
@@ -81,20 +80,91 @@ public:
 		return _sslIpsFile;
 	}
 
-	static inline uint64_t getTscHz()
+	std::string &getNotifyFile()
 	{
-		return _tsc_hz;
+		return _notify_acl_file;
 	}
-	
-	uint32_t _BufPoolSize = DEFAULT_MBUF_POOL_SIZE;
-	std::vector<int> _dpdkPortVec;
-	
+
+	static inline struct lcore_conf *getLcoreConf(uint32_t lcore_id)
+	{
+		return &_lcore_conf[lcore_id];
+	}
+
+	inline ACL * getACL()
+	{
+		return _acl;
+	}
+
+	inline int getNuma()
+	{
+		return _numa_on;
+	}
+
+	inline std::vector<DpdkWorkerThread*> &getThreadsVec()
+	{
+		return _workerThreadVec;
+	}
+
+	static inline extFilter *instance()
+	{
+		return _instance;
+	}
+
+	bool loadACL(std::set<struct rte_acl_ctx *> *to_del = NULL);
+
+	inline bool getNotifyEnabled()
+	{
+		return _notify_enabled;
+	}
+
+	inline bool setNotifyEnabled(bool ne)
+	{
+		_notify_enabled = ne;
+		if(ne)
+		{
+			for(auto const &thread : _workerThreadVec)
+			{
+				WorkerThread *w = (WorkerThread *)thread;
+				WorkerConfig &c = w->getConfig();
+				c.notify_enabled = true;
+			}
+		} else {
+			for(auto const &thread : _workerThreadVec)
+			{
+				WorkerThread *w = (WorkerThread *)thread;
+				WorkerConfig &c = w->getConfig();
+				c.notify_enabled = false;
+			}
+		}
+		return ne;
+	}
+
+	inline TriesManager *getTriesManager()
+	{
+		return &_tries;
+	}
+
+	inline operation_modes getOperationMode()
+	{
+		return _operation_mode;
+	}
+
+	static struct ether_addr ports_eth_addr[RTE_MAX_ETHPORTS];
 private:
-	int initPort(int port, struct rte_mempool *mbuf_pool, struct ether_addr *addr);
+	int initPort(uint8_t port, struct ether_addr *addr, bool no_promisc = false);
+	int initSenderPort(uint8_t port, struct ether_addr *addr, uint8_t nb_tx_queue);
+	int initMemory(uint8_t nb_ports);
+	int initACL();
+
+	uint8_t _get_ports_n_rx_queues(void);
+	uint8_t _get_port_n_rx_queues(uint8_t port);
+	int _init_lcore_rx_queues(void);
+	int _check_lcore_params(void);
+	int _check_port_config(const unsigned nb_ports);
+	int initDPIMemPools();
 
 	bool _helpRequested;
 	bool _listDPDKPorts;
-	int _nbRxQueues;
 
 	std::string _urlsFile;
 	std::string _domainsFile;
@@ -104,25 +174,38 @@ private:
 	std::string _protocolsFile;
 	std::string _statisticsFile;
 
-	bool _lower_host;
-	bool _match_url_exactly;
-	bool _block_undetected_ssl;
-	bool _http_redirect;
-	bool _url_normalization;
-	bool _remove_dot;
+	bool _block_ssl_no_sni;
 
-	int _num_of_readers;
-	int _num_of_workers;
 	int _statistic_interval;
-	uint32_t _ring_size;
-	enum ADD_P_TYPES _add_p_type;
-	struct CSender::params _sender_params;
-	
-	static uint64_t _tsc_hz;
-	uint32_t _flowhash_size;
-	uint32_t _flowhash_size_per_worker;
 
-	int _num_of_senders;
+	struct CSender::params _sender_params;
+
+	int _numa_on;
+	uint32_t _enabled_port_mask;
+
+	struct lcore_params _lcore_params_array[MAX_LCORE_PARAMS];
+	static struct lcore_conf _lcore_conf[RTE_MAX_LCORE];
+	uint16_t _nb_lcore_params;
+	struct lcore_params* _lcore_params;
+	struct rte_mempool* _pktmbuf_pool[NB_SOCKETS];
+
+	uint16_t _nb_rxd = EXTF_RX_DESC_DEFAULT;
+	uint16_t _nb_txd = EXTF_TX_DESC_DEFAULT;
+	unsigned _nb_ports;
+
+	ACL *_acl;
+
+	bool _notify_enabled;
+	std::map<int, struct NotificationParams> _notify_groups;
+	std::vector<DpdkWorkerThread*> _workerThreadVec;
+
+	static extFilter *_instance;
+	std::string _notify_acl_file;
+	int _cmdline_port;
+	Poco::Net::IPAddress _cmdline_ip;
+	uint8_t _dpdk_send_port;
+	TriesManager _tries;
+	operation_modes _operation_mode;
 };
 
 

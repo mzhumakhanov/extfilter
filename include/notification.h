@@ -16,93 +16,78 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *
 */
-#ifndef __SENDER_TASK_H
-#define __SENDER_TASK_H
+
+#pragma once
 
 #include <Poco/Task.h>
+#include <Poco/Logger.h>
 #include <Poco/Mutex.h>
 #include <Poco/Notification.h>
 #include <Poco/NotificationQueue.h>
 #include <Poco/AutoPtr.h>
-#include <Poco/Logger.h>
-#include <Poco/Net/IPAddress.h>
-
+#include <rte_config.h>
+#include <cmdline.h>
+#include <unordered_map>
+#include <map>
 #include "sender.h"
 
-class RedirectNotification: public Poco::Notification
-	// The notification sent to worker threads.
+#define DEFAULT_SUBSCRIBER_TABLE_SIZE 50000
+
+struct subscriber
 {
-public:
-	typedef Poco::AutoPtr<RedirectNotification> Ptr;
-	
-	RedirectNotification(int user_port, int dst_port, Poco::Net::IPAddress *user_ip, Poco::Net::IPAddress *dst_ip, uint32_t acknum, uint32_t seqnum, int f_psh, std::string &additional_param, bool is_rst=false):
-		_user_port(user_port),
-		_dst_port(dst_port),
-		_user_ip(*user_ip),
-		_dst_ip(*dst_ip),
-		_acknum(acknum),
-		_seqnum(seqnum),
-		_f_psh(f_psh),
-		_additional_param(additional_param),
-		_is_rst(is_rst)
+	uint32_t ipv4;
+	bool need_redirect;
+	uint64_t last_redirect;
+	uint64_t next_redirect;
+	uint64_t redirects;
+	int repeat;
+	subscriber()
 	{
+		last_redirect = 0;
+		next_redirect = 0;
+		redirects = 0;
+		repeat = 0;
 	}
-	int user_port()
-	{
-		return _user_port;
-	}
-	int dst_port()
-	{
-		return _dst_port;
-	}
-	Poco::Net::IPAddress &user_ip()
-	{
-		return _user_ip;
-	}
-	Poco::Net::IPAddress &dst_ip()
-	{
-		return _dst_ip;
-	}
-	u_int32_t acknum()
-	{
-		return _acknum;
-	}
-	u_int32_t seqnum()
-	{
-		return _seqnum;
-	}
-	int f_psh()
-	{
-		return _f_psh;
-	}
-	std::string &additional_param()
-	{
-		return _additional_param;
-	}
-	bool is_rst()
-	{
-		return _is_rst;
-	}
-private:
-	int _user_port;
-	int _dst_port;
-	Poco::Net::IPAddress _user_ip;
-	Poco::Net::IPAddress _dst_ip;
-	uint32_t _acknum;
-	uint32_t _seqnum;
-	int _f_psh;
-	std::string _additional_param;
-	bool _is_rst;
 };
 
+struct NotificationParams
+{
+	int group_id;
+	struct CSender::params prm;
+	int period;
+	int repeat;
+};
 
-class RedirectNotificationG: public Poco::Notification
-	// The notification sent to worker threads.
+class UpdateNotification: public Poco::Notification
 {
 public:
-	typedef Poco::AutoPtr<RedirectNotificationG> Ptr;
+	typedef Poco::AutoPtr<UpdateNotification> Ptr;
 	
-	RedirectNotificationG(int user_port, int dst_port, void *user_ip, void *dst_ip, int ip_version, uint32_t acknum, uint32_t seqnum, int f_psh, char *additional_param, bool is_rst=false):
+	UpdateNotification(uint32_t ip, uint32_t group_id) : _ip(ip), _group_id(group_id)
+	{
+	}
+
+	inline uint32_t getIP()
+	{
+		return _ip;
+	}
+
+	inline uint32_t group_id()
+	{
+		return _group_id;
+	}
+private:
+	uint32_t _ip;
+	uint32_t _group_id;
+};
+
+class NotifyRedirect: public Poco::Notification
+{
+public:
+	typedef Poco::AutoPtr<NotifyRedirect> Ptr;
+	
+	NotifyRedirect(uint32_t notify_group, int user_port, int dst_port, void *user_ip, void *dst_ip, int ip_version, uint32_t acknum, uint32_t seqnum, int f_psh, char *additional_param, bool is_rst=false):
+		_notify_group(notify_group),
 		_user_port(user_port),
 		_dst_port(dst_port),
 		_ip_version(ip_version),
@@ -165,7 +150,12 @@ public:
 	{
 		return _ip_version;
 	}
+	uint32_t notify_group()
+	{
+		return _notify_group;
+	}
 private:
+	uint32_t _notify_group;
 	int _user_port;
 	int _dst_port;
 	union
@@ -186,44 +176,30 @@ private:
 	bool _is_rst;
 };
 
-struct redirectEvent
-{
-	uint16_t _user_port;
-	uint16_t _dst_port;
-	union
-	{
-		uint32_t ipv4;
-		__m128i ipv6;
-	} _user_ip;
-	union
-	{
-		uint32_t ipv4;
-		__m128i ipv6;
-	} _dst_ip;
-	uint8_t _ip_version;
-	uint32_t _acknum;
-	uint32_t _seqnum;
-	uint8_t _f_psh;
-	char *_additional_param;
-	uint8_t _is_rst;
-};
+class extFilter;
 
-
-
-/// Данная задача отсылает редирект заданному клиенту
-class SenderTask: public Poco::Task
+class NotifyManager : public Poco::Task
 {
 public:
-	SenderTask(BSender *snd, int instance);
-	~SenderTask();
-
+	struct redirect_params
+	{
+		std::string code;
+		std::string redirect_url;
+	};
+	NotifyManager(int size, std::map<int, struct NotificationParams> &prms);
+	~NotifyManager();
+	
+	bool needNotify(uint32_t ip, int group_id);
 	void runTask();
-
-	// очередь, куда необходимо писать отправные данные...
+	static void printSubscribers(struct cmdline* cl, uint32_t ip);
 	static Poco::NotificationQueue queue;
 private:
-	BSender *sender;
 	Poco::Logger& _logger;
+	std::unordered_map<uint32_t, struct subscriber> subs;
+	Poco::FastMutex subsLock;
+	long _timeout; // msec
+	static NotifyManager *_instance;
+	std::unordered_map<int, CSender *> _senders;
+	std::map<int, struct NotificationParams> _params;
 };
 
-#endif

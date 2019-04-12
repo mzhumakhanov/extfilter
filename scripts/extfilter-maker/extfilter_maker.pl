@@ -15,7 +15,7 @@ use Digest::MD5 qw (md5);
 use Log::Log4perl;
 use Net::IP qw(:PROC);
 use Encode;
-
+use Net::CIDR::Lite;
 
 binmode(STDOUT,':utf8');
 binmode(STDERR,':utf8');
@@ -45,6 +45,10 @@ my $domains_ssl = $Config->{'APP.domains_ssl'} || "false";
 $domains_ssl = lc($domains_ssl);
 my $only_original_ssl_ip = $Config->{'APP.only_original_ssl_ip'} || "false";
 $only_original_ssl_ip = lc($only_original_ssl_ip);
+my $make_sp_chars = $Config->{'APP.make_sp_chars'} || "false";
+$make_sp_chars = lc($make_sp_chars);
+my $ips_to_hosts = lc($Config->{'APP.ips_to_hosts'} || "false");
+my $nets_to_hosts = lc($Config->{'APP.nets_to_hosts'} || "false");
 
 my $dbh = DBI->connect("DBI:mysql:database=".$db_name.";host=".$db_host,$db_user,$db_pass,{mysql_enable_utf8 => 1}) or die DBI->errstr;
 $dbh->do("set names utf8");
@@ -61,6 +65,7 @@ my %already_out;
 my $domains_file_hash_old=get_md5_sum($domains_file);
 my $urls_file_hash_old=get_md5_sum($urls_file);
 my $ssl_host_file_hash_old=get_md5_sum($ssls_file);
+my $hosts_file_hash_old=get_md5_sum($hosts_file);
 
 open (my $DOMAINS_FILE, ">",$domains_file) or die "Could not open DOMAINS '$domains_file' file: $!";
 open (my $URLS_FILE, ">",$urls_file) or die "Could not open URLS '$urls_file' file: $!";
@@ -79,22 +84,20 @@ my %https_add_ports;
 
 my %ssl_hosts;
 my %ssl_ip;
+my %hosts;
 
-my $n_masked_domains = 0;
-my %masked_domains;
 my %domains;
+
 my $sth = $dbh->prepare("SELECT * FROM zap2_domains WHERE domain like '*.%'");
 $sth->execute();
 while (my $ips = $sth->fetchrow_hashref())
 {
 	my $dm = $ips->{domain};
 	$dm =~ s/\*\.//g;
-	my $domain_canonical=new URI("http://".$dm)->canonical();
-	$domain_canonical =~ s/^http\:\/\///;
-	$domain_canonical =~ s/\/$//;
-	$domain_canonical =~ s/\.$//;
-	$masked_domains{$domain_canonical} = 1;
-	$n_masked_domains++;
+	$dm =~ s/\\//g;
+	my $uri = new URI("http://".$dm);
+	my $domain_canonical = lc($uri->host());
+	treeAddDomain(\%domains, "*.".$domain_canonical, 1);
 	print $DOMAINS_FILE "*.",$domain_canonical,"\n";
 	if($domains_ssl eq "true")
 	{
@@ -102,56 +105,51 @@ while (my $ips = $sth->fetchrow_hashref())
 	}
 }
 $sth->finish();
-
-$sth = $dbh->prepare("SELECT * FROM zap2_domains");
+$sth = $dbh->prepare("SELECT * FROM zap2_domains WHERE domain not like '*.%'");
 $sth->execute;
 while (my $ips = $sth->fetchrow_hashref())
 {
 	my $domain=$ips->{domain};
-	my $domain_canonical=new URI("http://".$domain)->canonical();
-	$domain_canonical =~ s/^http\:\/\///;
-	$domain_canonical =~ s/\/$//;
-	$domain_canonical =~ s/\.$//;
-	my $skip = 0;
-	foreach my $dm (keys %masked_domains)
-	{
-		if($domain_canonical =~ /\.$dm$/ || $domain_canonical =~ /^$dm$/)
-		{
-#			print "found mask $dm for domain $domain\n";
-			$skip++;
-			last;
-		}
-	}
-	next if($skip);
-	if(defined $domains{$domain_canonical})
-	{
-		$logger->warn("Domain $domain_canonical already present in the domains list");
-		next;
-	}
-	$domains{$domain_canonical}=1;
+	$domain =~ s/\\//g;
+	my $uri = new URI("http://".$domain);
+	my $domain_canonical = lc($uri->host());
+	next if(treeFindDomain(\%domains, $domain_canonical));
+	treeAddDomain(\%domains, $domain_canonical, 0);
 	$logger->debug("Canonical domain: $domain_canonical");
 	print $DOMAINS_FILE $domain_canonical."\n";
 	if($domains_ssl eq "true")
 	{
 		next if(defined $ssl_hosts{$domain_canonical});
 		$ssl_hosts{$domain_canonical}=1;
-		print $SSL_HOST_FILE (length($domain_canonical) > 47 ? (substr($domain_canonical,0,47)."\n"): "$domain_canonical\n");
+		print $SSL_HOST_FILE (length($domain_canonical) > 255 ? (substr($domain_canonical,0,255)."\n"): "$domain_canonical\n");
 		my @ssl_ips=get_ips_for_record_id($ips->{record_id});
 		foreach my $ip (@ssl_ips)
 		{
 			next if(defined $ssl_ip{$ip});
 			$ssl_ip{$ip}=1;
-			print $SSL_IPS_FILE "$ip","\n";
+			if($ip =~ /^(\d{1,3}\.){3}\d{1,3}$/)
+			{
+				print $SSL_IPS_FILE "$ip","\n";
+			} else {
+				print $SSL_IPS_FILE "[$ip]","\n";
+			}
 		}
 	}
 }
 $sth->finish();
-
 $sth = $dbh->prepare("SELECT * FROM zap2_urls");
 $sth->execute;
 while (my $ips = $sth->fetchrow_hashref())
 {
 	my $url2=$ips->{url};
+	# cut from first &#
+	if((my $idx=index($url2,"&#")) != -1)
+	{
+		$url2 = substr($url2, 0, $idx);
+	}
+	# delete fragment
+	$url2 =~ s/^(.*)\#(.*)$/$1/;
+
 	my $url1=new URI($url2);
 	my $scheme=$url1->scheme();
 	if($scheme !~ /http/ && $scheme !~ /https/)
@@ -164,45 +162,35 @@ while (my $ips = $sth->fetchrow_hashref())
 			my @url_ips=get_ips_for_record_id($ips->{record_id});
 			foreach my $ip (@url_ips)
 			{
-				print $HOSTS_FILE "$ip:",$ipp[2],"\n";
+				if($ip =~ /^(\d{1,3}\.){3}\d{1,3}$/)
+				{
+					print $HOSTS_FILE "$ip:",$ipp[2],"\n";
+				} else {
+					print $HOSTS_FILE "[$ip]:",$ipp[2],"\n";
+				}
 			}
 		}
 		next;
 	}
 	my $host=lc($url1->host());
+	next if(($host !~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/ && $scheme ne 'https') && treeFindDomain(\%domains, $host));
 	my $path=$url1->path();
 	my $query=$url1->query();
 	my $port=$url1->port();
 
-	$host =~ s/\.$//;
-
 	my $do=0;
-	my $skip = 0;
-	foreach my $dm (keys %masked_domains)
-	{
-		if($host =~ /\.\Q$dm\E$/ || $host =~ /^\Q$dm\E$/)
-		{
-#			print "found mask $dm for domain $host\n";
-			$skip++;
-			last;
-		}
-	}
-	next if($skip);
-	if(defined $domains{$host})
-	{
-#		$logger->warn("Host '$host' from url '$url2' present in the domains");
-		next;
-	}
+
 	if($scheme eq 'https')
 	{
-		next if(defined $ssl_hosts{$host});
-		$ssl_hosts{$host}=1;
-		print $SSL_HOST_FILE (length($host) > 47 ? (substr($host,0,47)."\n"): "$host\n");
-		if($host =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/)
+		if($host =~ /(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/ && !defined $hosts{"$host:$port"})
 		{
 			#print "Host name is an ip address, add to ip:port file\n";
-			print $HOSTS_FILE "$host:",$port,"\n";
+			print $HOSTS_FILE "$host:", $port ,"\n";
+			$hosts{"$host:$port"} = 1;
 		}
+		next if(defined $ssl_hosts{$host});
+		$ssl_hosts{$host}=1;
+		print $SSL_HOST_FILE (length($host) > 255 ? (substr($host, 0, 255)."\n"): "$host\n");
 		if($port ne "443")
 		{
 			$logger->info("Adding $port to https protocol");
@@ -213,7 +201,12 @@ while (my $ips = $sth->fetchrow_hashref())
 		{
 			next if(defined $ssl_ip{$ip});
 			$ssl_ip{$ip}=1;
-			print $SSL_IPS_FILE "$ip","\n";
+			if($ip =~ /^(\d{1,3}\.){3}\d{1,3}$/)
+			{
+				print $SSL_IPS_FILE "$ip","\n";
+			} else {
+				print $SSL_IPS_FILE "[$ip]","\n";
+			}
 		}
 		next;
 	}
@@ -224,48 +217,38 @@ while (my $ips = $sth->fetchrow_hashref())
 	}
 
 	$url1->host($host);
+	my $as_str = $url1->as_string();
+	$path =~ s/\/+/\//g;
+	$path =~ s/http\:\//http\:\/\//g;
+	$url1->path($path);
+
 	my $url11 = $url1->canonical();
 
 	$url11 =~ s/^http\:\/\///;
 	$url2 =~ s/^http\:\/\///;
-
-	my $host_end=index($url2,'/',7);
-	my $need_add_dot=0;
-	$need_add_dot=1 if(substr($url2, $host_end-1 , 1) eq ".");
-
-	# убираем любое упоминание о фрагменте... оно не нужно
-	$url11 =~ s/^(.*)\#(.*)$/$1/g;
-	$url2 =~ s/^(.*)\#(.*)$/$1/g;
-
-	if((my $idx=index($url2,"&#")) != -1)
-	{
-		$url2 = substr($url2,0,$idx);
-	}
+	$as_str =~ s/^http\:\/\///;
 
 	$url2 .= "/" if($url2 !~ /\//);
 
-	$url11 =~ s/\/+/\//g;
-	$url2 =~ s/\/+/\//g;
-
-	$url11 =~ s/http\:\//http\:\/\//g;
-	$url2 =~ s/http\:\//http\:\/\//g;
-
-	$url11 =~ s/\/http\:\/\//\/http\:\//g;
-	$url2 =~ s/\/http\:\/\//\/http\:\//g;
-
 	$url11 =~ s/\?$//g;
-	$url2 =~ s/\?$//g;
 
 	$url11 =~ s/\/\.$//;
-	$url2 =~ s/\/\.$//;
-	$url11 =~ s/\//\.\// if($need_add_dot);
+
 	insert_to_url($url11);
 	if($url2 ne $url11)
 	{
-#		print "insert original url $url2\n";
 		insert_to_url($url2);
 	}
-	make_special_chars($url11,$url1->as_iri(),$need_add_dot);
+	if($as_str ne $url2 || $as_str ne $url11)
+	{
+		my $last_char_1 = substr($url11, -1);
+		my $last_char_2 = substr($as_str, -1);
+		if($last_char_1 eq $last_char_2)
+		{
+			insert_to_url($as_str);
+		}
+	}
+	make_special_chars($url11, $url1->as_iri(), 0) if($make_sp_chars eq "true");
 }
 $sth->finish();
 
@@ -291,6 +274,8 @@ if($n)
 	print $PROTOS_FILE "\@SSL\n";
 }
 
+ips_to_hosts() if($ips_to_hosts eq "true");
+nets_to_hosts() if($nets_to_hosts eq "true");
 
 close $DOMAINS_FILE;
 close $URLS_FILE;
@@ -304,10 +289,11 @@ $dbh->disconnect();
 my $domains_file_hash=get_md5_sum($domains_file);
 my $urls_file_hash=get_md5_sum($urls_file);
 my $ssl_host_file_hash=get_md5_sum($ssls_file);
+my $hosts_file_hash=get_md5_sum($hosts_file);
 
-if($domains_file_hash ne $domains_file_hash_old || $urls_file_hash ne $urls_file_hash_old || $ssl_host_file_hash ne $ssl_host_file_hash_old)
+if($domains_file_hash ne $domains_file_hash_old || $urls_file_hash ne $urls_file_hash_old || $ssl_host_file_hash ne $ssl_host_file_hash_old || $hosts_file_hash ne $hosts_file_hash_old)
 {
-	system("/bin/systemctl", "reload-or-restart","extfilter");
+	system("/bin/systemctl", "reload-or-restart", "extfilter");
 	if($? != 0)
 	{
 		$logger->error("Can't reload or restart extfilter!");
@@ -409,6 +395,7 @@ sub make_special_chars
 	{
 		$url =~ s/\%5C/\//g;
 		$logger->debug("Write changed url (slashes) to the file");
+		$url =~ s/\/\/$/\//;
 		insert_to_url($url);
 	}
 	_encode_space($url);
@@ -426,7 +413,7 @@ sub make_special_chars
 		if($str ne $orig_rkn)
 		{
 			$logger->debug("Write url in cp1251 to the file");
-			print $URLS_FILE $str."\n";
+			print $URLS_FILE (length($str) > 600 ? (substr($str,0,600)): "$str")."\n";
 		}
 		if($url ne $orig_rkn)
 		{
@@ -443,5 +430,100 @@ sub insert_to_url
 	my $sum = md5($encoded);
 	return if(defined $already_out{$sum});
 	$already_out{$sum}=1;
+	if(length($encoded) > 600)
+	{
+		$encoded = substr($encoded, 0, 600);
+		if(substr($encoded, length($encoded) - 1, 1) eq "%")
+		{
+			$encoded = substr($encoded, 0, length($encoded) -1);
+		} elsif (substr($encoded, length($encoded) - 2, 1) eq "%")
+		{
+			$encoded = substr($encoded, 0, length($encoded) - 2);
+		}
+	}
 	print $URLS_FILE $encoded."\n";
+}
+
+# Код от ixi
+sub treeAddDomain
+{
+	my ($tree, $domain, $masked) = @_;
+	$domain .= "d" if(substr($domain, length($domain)-1, 1) eq '.');
+	my @d = split /\./, $domain;
+	my $cur = $tree;
+	my $prev;
+	while (defined(my $part = pop @d))
+	{
+		$prev = $cur;
+		$cur = $prev->{$part};
+		if ($part eq '*') { # Заблокировано по маске
+			last;
+		} elsif (!$cur) {
+			$cur = $prev->{$part} = {};
+		}
+	}
+
+	if ($masked)
+	{
+		my $first = $domain;
+		$first =~ s/(\.).+$//;
+		$prev->{$first || $domain} = '*';
+	} else {
+		$cur->{'.'} = 1
+	}
+
+}
+
+sub treeFindDomain
+{
+	my ($tree, $domain) = @_;
+	my $r = $tree;
+	$domain .= "d" if(substr($domain, length($domain)-1, 1) eq '.');
+	my @d = split /\./, $domain;
+	while (defined(my $part = pop @d))
+	{
+		$r = $r->{$part};
+		return 0 unless $r;
+		return 1 if ($r && exists $r->{'*'});
+	}
+	return $r->{'.'} || 0;
+}
+
+sub ips_to_hosts
+{
+	my $ip_cidr = new Net::CIDR::Lite;
+	my $ip6_cidr = new Net::CIDR::Lite;
+	my $sth = $dbh->prepare("SELECT ip FROM zap2_only_ips");
+	$sth->execute;
+	while (my $ips = $sth->fetchrow_hashref())
+	{
+		my $ip = get_ip($ips->{ip});
+		if($ip =~ /^(\d{1,3}\.){3}\d{1,3}$/)
+		{
+			$ip_cidr->add_any($ip);
+		} else {
+			$ip6_cidr->add_any($ip);
+		}
+	}
+	$sth->finish();
+	foreach my $ip (@{$ip_cidr->list()})
+	{
+		print $HOSTS_FILE "$ip", ", 6/0xfe", "\n";
+	}
+	foreach my $ip6 (@{$ip6_cidr->list()})
+	{
+		print $HOSTS_FILE "[$ip6]", ", 6/0xfe", "\n";
+	}
+	
+}
+
+sub nets_to_hosts
+{
+	my $sth = $dbh->prepare("SELECT subnet FROM zap2_subnets");
+	$sth->execute;
+	while (my $ips = $sth->fetchrow_hashref())
+	{
+		print $HOSTS_FILE "$ips->{subnet}", ", 6/0xfe", "\n";
+	}
+	$sth->finish();
 }

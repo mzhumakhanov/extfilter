@@ -17,27 +17,8 @@
 *
 */
 
-#ifndef __PATR_H
-#define __PATR_H
+#pragma once
 
-#include <Poco/Net/IPAddress.h>
-#include <string>
-#include "patricia.h"
+#include <cstddef>
 
-class Patricia
-{
-public:
-	Patricia();
-	~Patricia();
-
-	patricia_node_t *make_and_lookup(std::string &addr);
-	/// Поиск только по адресу
-	patricia_node_t *try_search_exact_ip(Poco::Net::IPAddress &address);
-	void print_all_nodes();
-private:
-	bool fill_prefix(int family, void *dest, int bitlen, prefix_t &prefix);
-	patricia_tree_t *tree_ipv4;
-	patricia_tree_t *tree_ipv6;
-};
-
-#endif
+std::size_t url_encode(char *buf, const char *from, std::size_t len, std::size_t buf_size);

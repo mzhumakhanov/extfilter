@@ -1,9 +1,30 @@
+/*
+*
+*    Copyright (C) Max <max1976@mail.ru>
+*
+*    This program is free software: you can redistribute it and/or modify
+*    it under the terms of the GNU General Public License as published by
+*    the Free Software Foundation, either version 3 of the License, or
+*    (at your option) any later version.
+*
+*    This program is distributed in the hope that it will be useful,
+*    but WITHOUT ANY WARRANTY; without even the implied warranty of
+*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*    GNU General Public License for more details.
+*
+*    You should have received a copy of the GNU General Public License
+*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*/
 
 #include "flow.h"
+#include "params.h"
+#include "cfg.h"
 
 #include <rte_ip.h>
 #include <rte_udp.h>
 #include <rte_tcp.h>
+#include <Poco/Util/ServerApplication.h>
 
 //#ifdef RTE_MACHINE_CPUFLAG_SSE4_2
 #include <rte_hash_crc.h>
@@ -13,147 +34,235 @@
 //#define DEFAULT_HASH_FUNC       rte_jhash
 //#endif
 
-int ndpi_workflow_node_cmp(const void *a, const void *b)
-{
-	
-	struct ndpi_flow_info *fa = (struct ndpi_flow_info*)a;
-	struct ndpi_flow_info *fb = (struct ndpi_flow_info*)b;
+rte_xmm_t mask0 = {.u32 = {BIT_8_TO_15, ALL_32_BITS, ALL_32_BITS, ALL_32_BITS} };
+rte_xmm_t mask1 = {.u32 = {BIT_16_TO_23, ALL_32_BITS, ALL_32_BITS, ALL_32_BITS} };
+rte_xmm_t mask2 = {.u32 = {ALL_32_BITS, ALL_32_BITS, 0, 0} };
 
-	if(fa->hash < fb->hash)
-	{
-		return -1;
-	} else {
-		if(fa->hash > fb->hash)
-			return 1;
-	}
-/*	if(fa->lower_ip   < fb->lower_ip  ) return(-1); else { if(fa->lower_ip   > fb->lower_ip  ) return(1); }
-	if(fa->lower_port < fb->lower_port) return(-1); else { if(fa->lower_port > fb->lower_port) return(1); }
-	if(fa->upper_ip   < fb->upper_ip  ) return(-1); else { if(fa->upper_ip   > fb->upper_ip  ) return(1); }
-	if(fa->upper_port < fb->upper_port) return(-1); else { if(fa->upper_port > fb->upper_port) return(1); }
-	if(fa->protocol   < fb->protocol  ) return(-1); else { if(fa->protocol   > fb->protocol  ) return(1); }
-*/
-	return(0);
+static int compare_ipv4(const void *key1, const void *key2, size_t key_len)
+{
+	ipv4_5tuple_host *flow = (ipv4_5tuple_host *) key1;
+	ipv4_5tuple_host *pkt_infos = (ipv4_5tuple_host *) key2;
+
+	return !((flow->ip_src == pkt_infos->ip_src &&
+		 flow->ip_dst == pkt_infos->ip_dst &&
+		 flow->port_src == pkt_infos->port_src &&
+		 flow->port_dst == pkt_infos->port_dst) ||
+		(flow->ip_src == pkt_infos->ip_dst &&
+		 flow->ip_dst == pkt_infos->ip_src &&
+		 flow->port_src == pkt_infos->port_dst &&
+		 flow->port_dst == pkt_infos->port_src)) &&
+		 flow->proto == pkt_infos->proto;
 }
 
-flowHash::flowHash(int socket_id, int thread_id, int flowHashSize) : _logger(Poco::Logger::get("FlowHash_" + std::to_string(thread_id))),
-	_flowHashSize(flowHashSize)
+static int compare_ipv6(const void *key1, const void *key2, size_t key_len)
 {
+	ipv6_5tuple_host *flow = (ipv6_5tuple_host *) key1;
+	ipv6_5tuple_host *pkt_infos = (ipv6_5tuple_host *) key2;
+
+	u_int8_t i;
+
+	/*1: src=src and dst=dst. 2: src=dst and dst=src. */
+	u_int8_t direction=0;
+
+	for(i=0; i< 16; i++)
+	{
+		if(direction!=2 &&
+		  pkt_infos->ip_src[i] == flow->ip_src[i] &&
+		  pkt_infos->ip_dst[i] == flow->ip_dst[i])
+		{
+			direction=1;
+		}else if(direction!=1 &&
+			  pkt_infos->ip_src[i] == flow->ip_dst[i] &&
+			  pkt_infos->ip_dst[i] == flow->ip_src[i])
+		{
+			direction=2;
+		}else
+			return 1;
+	}
+
+	if(direction==1)
+		return !(flow->port_src == pkt_infos->port_src &&
+			   flow->port_dst == pkt_infos->port_dst &&
+			   flow->proto == pkt_infos->proto);
+	else if(direction==2)
+		return !(flow->port_src == pkt_infos->port_dst &&
+			   flow->port_dst == pkt_infos->port_src &&
+			   flow->proto == pkt_infos->proto);
+	else
+		return 1;
+
+}
+
+void initFlowStorages()
+{
+	int socketid = 0;
+	Poco::Util::Application& app = Poco::Util::Application::instance();
+
+	// allocate mempool for all flows
+	app.logger().information("Allocating %Lu bytes (%u entries) for ipv4 flow pool", (uint64_t) ((global_prm->memory_configs.ipv4.flows_number)*sizeof(struct ext_dpi_flow_info_ipv4)), global_prm->memory_configs.ipv4.flows_number);
+	rte_mempool *flows_pool_ipv4 = rte_mempool_create("ipv4_flows_p", global_prm->memory_configs.ipv4.flows_number, sizeof(struct ext_dpi_flow_info_ipv4), 0, 0, NULL, NULL, NULL, NULL, socketid, 0);
+	if(flows_pool_ipv4 == nullptr)
+	{
+		app.logger().fatal("Not enough memory for ipv4 flows pool. Tried to allocate %Lu bytes on socket %d", (uint64_t) ((global_prm->memory_configs.ipv4.flows_number)*sizeof(struct ext_dpi_flow_info_ipv4)), socketid);
+		throw Poco::Exception("Not enough memory for flows pool");
+	}
+
+	app.logger().information("Allocating %Lu bytes (%u entries) for ipv6 flow pool", (uint64_t) ((global_prm->memory_configs.ipv6.flows_number)*sizeof(struct ext_dpi_flow_info_ipv6)), global_prm->memory_configs.ipv6.flows_number);
+
+	rte_mempool *flows_pool_ipv6 = rte_mempool_create("ipv6_flows_p", (global_prm->memory_configs.ipv6.flows_number), sizeof(struct ext_dpi_flow_info_ipv6), 0, 0, NULL, NULL, NULL, NULL, socketid, 0);
+	if(flows_pool_ipv6 == nullptr)
+	{
+		app.logger().fatal("Not enough memory for ipv6 flows pool. Tried to allocate %Lu bytes on socket %d", (uint64_t) ((global_prm->memory_configs.ipv6.flows_number )*sizeof(struct ext_dpi_flow_info_ipv6)), socketid);
+		throw Poco::Exception("Not enough memory for flows pool");
+	}
+
+	flow_storage_params_t prm;
+	prm.p_lifetime = global_prm->flow_lifetime;
+	for(int i=0; i < global_prm->workers_number; i++)
+	{
+		prm.worker_id = i;
+		prm.mempool = flows_pool_ipv4;
+		prm.recs_number = global_prm->memory_configs.ipv4.recs_number / global_prm->memory_configs.ipv4.parts_of_flow;
+		flow_storage_t *flows = &worker_params[i].flows_ipv4;
+		if(global_prm->memory_configs.ipv4.parts_of_flow > 0)
+		{
+			flows->flows = new (std::nothrow) FlowStorage*[global_prm->memory_configs.ipv4.parts_of_flow];
+			if(!flows->flows)
+			{
+				app.logger().fatal("Not enough memory for FlowStorage pointers");
+				throw Poco::Exception("Not enough memory for FlowStorage pointers");
+			}
+			memset(flows->flows, 0, sizeof(FlowStorage *)*global_prm->memory_configs.ipv4.parts_of_flow);
+			for(int z=0; z < global_prm->memory_configs.ipv4.parts_of_flow; z++)
+			{
+				prm.part_no = z;
+				flows->flows[z] = new FlowStorageIPV4(&prm);
+				if(flows->flows[z]->init(&prm))
+				{
+					app.logger().fatal("Unable to init FlowStorageIPV4");
+					throw Poco::Exception("Unable to init FlowStorageIPV4");
+				}
+			}
+		}
+
+		prm.mempool = flows_pool_ipv6;
+		prm.recs_number = global_prm->memory_configs.ipv6.recs_number / global_prm->memory_configs.ipv6.parts_of_flow;
+		flows = &worker_params[i].flows_ipv6;
+		// setup ipv6
+		if(global_prm->memory_configs.ipv6.parts_of_flow > 0)
+		{
+			flows->flows = new (std::nothrow) FlowStorage*[global_prm->memory_configs.ipv6.parts_of_flow];
+			if(!flows->flows)
+			{
+				app.logger().fatal("Not enough memory for FlowStorage pointers");
+				throw Poco::Exception("Not enough memory for FlowStorage pointers");
+			}
+			memset(flows->flows, 0, sizeof(FlowStorage *)*global_prm->memory_configs.ipv6.parts_of_flow);
+			for(int z=0; z < global_prm->memory_configs.ipv6.parts_of_flow; z++)
+			{
+				prm.part_no = z;
+				flows->flows[z] = new FlowStorageIPV6(&prm);
+				if(flows->flows[z]->init(&prm))
+				{
+					app.logger().fatal("Unable to init FlowStorageIPV6");
+					throw Poco::Exception("Unable to init FlowStorageIPV6");
+				}
+			}
+		}
+
+	}
+}
+
+// ipv4
+FlowStorageIPV4::FlowStorageIPV4(flow_storage_params_t *prm) : FlowStorage(prm->mempool),
+	_logger(Poco::Logger::get("FlowStorageIPV4"))
+{
+	// init hash
+	_logger.information("Allocate %d bytes (%d entries, element size %z) for flow hash ipv4", (int)(prm->recs_number * sizeof(union ipv4_5tuple_host)), (int)prm->recs_number, sizeof(union ipv4_5tuple_host));
 	struct rte_hash_parameters ipv4_hash_params = {0};
-	std::string ipv4_hash_name("ipv4_flow_hash_" + std::to_string(thread_id));
-	ipv4_hash_params.entries = _flowHashSize;
-	ipv4_hash_params.key_len = sizeof(struct ipv4_5tuple);
-	ipv4_hash_params.hash_func = DEFAULT_HASH_FUNC;
+	ipv4_hash_params.entries = prm->recs_number;
+	ipv4_hash_params.key_len = sizeof(union ipv4_5tuple_host);
+	ipv4_hash_params.hash_func = ipv4_hash_crc;
 	ipv4_hash_params.hash_func_init_val = 0;
-	ipv4_hash_params.name = ipv4_hash_name.c_str();
-	ipv4_FlowHash = rte_hash_create(&ipv4_hash_params);
-	if(!ipv4_FlowHash)
+	std::string hash_name("ipv4_fh" + std::to_string(prm->worker_id) + "_" + std::to_string(prm->part_no));
+	ipv4_hash_params.name = hash_name.c_str();
+	hash = rte_hash_create(&ipv4_hash_params);
+	if(!hash)
 	{
 		_logger.fatal("Unable to create ipv4 flow hash");
 		throw Poco::Exception("Unable to create ipv4 flow hash");
 	}
-	std::string ipv6_hash_name("ipv6_flow_hash_" + std::to_string(thread_id));
+	rte_hash_set_cmp_func(hash, compare_ipv4);
+
+	// init pointers for hash data
+	std::string mem_name("ipv4_f" + std::to_string(prm->worker_id) + "_" + std::to_string(prm->part_no));
+	_logger.information("Allocating %d bytes (%d entries) for ipv4_flows", (int) (sizeof(struct ext_dpi_flow_info_ipv4 *) * prm->recs_number), (int)prm->recs_number);
+	data = (struct ext_dpi_flow_info_ipv4 **)rte_zmalloc(mem_name.c_str(), prm->recs_number * sizeof(struct ext_dpi_flow_info_ipv4 *), RTE_CACHE_LINE_SIZE);
+	if(data == nullptr)
+	{
+		_logger.fatal("Not enough memory for ipv4 flows");
+		throw Poco::Exception("Not enough memory for ipv4 flows");
+	}
+	
+}
+
+FlowStorageIPV4::~FlowStorageIPV4()
+{
+	// delete hash
+	rte_hash_free(hash);
+	// delete data
+	rte_free(data);
+}
+
+int FlowStorageIPV4::init(flow_storage_params_t *prm)
+{
+	if(short_alfs.init(prm->recs_number, prm->worker_id, en_alfs_short, prm->p_lifetime[0], 32))
+		return -1;
+	return long_alfs.init(prm->recs_number, prm->worker_id, en_alfs_long, prm->p_lifetime[1], 8);
+}
+
+// ipv6
+FlowStorageIPV6::FlowStorageIPV6(flow_storage_params_t *prm) : FlowStorage(prm->mempool),
+	_logger(Poco::Logger::get("FlowStorageIPV6"))
+{
+	// init hash
+	_logger.information("Allocate %d bytes (%d entries, element size %z) for flow hash ipv6", (int)(prm->recs_number * sizeof(union ipv6_5tuple_host)), (int)prm->recs_number, sizeof(union ipv6_5tuple_host));
 	struct rte_hash_parameters ipv6_hash_params = {0};
-	ipv6_hash_params.entries = _flowHashSize;
-	ipv6_hash_params.key_len = sizeof(struct ipv6_5tuple);
-	ipv6_hash_params.hash_func = DEFAULT_HASH_FUNC;
+	ipv6_hash_params.entries = prm->recs_number;
+	ipv6_hash_params.key_len = sizeof(union ipv6_5tuple_host);
+	ipv6_hash_params.hash_func = ipv6_hash_crc;
 	ipv6_hash_params.hash_func_init_val = 0;
-	ipv6_hash_params.name = ipv6_hash_name.c_str();
-	ipv6_FlowHash = rte_hash_create(&ipv6_hash_params);
-	if(!ipv4_FlowHash)
+	std::string hash_name("ipv6_fh" + std::to_string(prm->worker_id) + "_" + std::to_string(prm->part_no));
+	ipv6_hash_params.name = hash_name.c_str();
+	hash = rte_hash_create(&ipv6_hash_params);
+	if(!hash)
 	{
 		_logger.fatal("Unable to create ipv6 flow hash");
 		throw Poco::Exception("Unable to create ipv6 flow hash");
 	}
-}
-
-
-flowHash::~flowHash()
-{
-	rte_hash_free(ipv4_FlowHash);
-	rte_hash_free(ipv6_FlowHash);
-}
-
-
-void flowHash::makeIPv4Key(struct ipv4_hdr *ipv4_hdr, struct ipv4_5tuple *key)
-{
-	struct tcp_hdr *tcp;
-	struct udp_hdr *udp;
-
-	key->ip_dst = ipv4_hdr->dst_addr;
-	key->ip_src = ipv4_hdr->src_addr;
-	key->proto = ipv4_hdr->next_proto_id;
-
-	switch (ipv4_hdr->next_proto_id)
+	rte_hash_set_cmp_func(hash, compare_ipv6);
+	// init pointers for hash data
+	std::string mem_name("ipv6_f" + std::to_string(prm->worker_id) + "_" + std::to_string(prm->part_no));
+	_logger.information("Allocating %d bytes (%d entries) for ipv6_flows", (int) (sizeof(struct ext_dpi_flow_info_ipv6 *) * prm->recs_number), (int)prm->recs_number);
+	data = (struct ext_dpi_flow_info_ipv6 **)rte_zmalloc(mem_name.c_str(), prm->recs_number * sizeof(struct ext_dpi_flow_info_ipv6 *), RTE_CACHE_LINE_SIZE);
+	if(data == nullptr)
 	{
-		case IPPROTO_TCP:
-			tcp = (struct tcp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct ipv4_hdr));
-			key->port_dst = rte_be_to_cpu_16(tcp->dst_port);
-			key->port_src = rte_be_to_cpu_16(tcp->src_port);
-			break;
-
-		case IPPROTO_UDP:
-			udp = (struct udp_hdr *)((unsigned char *)ipv4_hdr + sizeof(struct ipv4_hdr));
-			key->port_dst = rte_be_to_cpu_16(udp->dst_port);
-			key->port_src = rte_be_to_cpu_16(udp->src_port);
-			break;
-
-		default:
-			key->port_dst = 0;
-			key->port_src = 0;
-			break;
+		_logger.fatal("Not enough memory for ipv6 flows");
+		throw Poco::Exception("Not enough memory for ipv6 flows");
 	}
 }
 
-void flowHash::makeIPv6Key(struct ipv6_hdr *ipv6_hdr, struct ipv6_5tuple *key)
+FlowStorageIPV6::~FlowStorageIPV6()
 {
-	struct tcp_hdr *tcp;
-	struct udp_hdr *udp;
-
-	rte_mov16(key->ip_dst, (const uint8_t*) ipv6_hdr->dst_addr);
-	rte_mov16(key->ip_src, (const uint8_t*) ipv6_hdr->src_addr);
-
-	key->proto = ipv6_hdr->proto;
-
-	switch (ipv6_hdr->proto)
-	{
-		case IPPROTO_TCP:
-			tcp = (struct tcp_hdr *)((unsigned char *) ipv6_hdr + sizeof(struct ipv6_hdr));
-			key->port_dst = rte_be_to_cpu_16(tcp->dst_port);
-			key->port_src = rte_be_to_cpu_16(tcp->src_port);
-			break;
-
-		case IPPROTO_UDP:
-			udp = (struct udp_hdr *)((unsigned char *) ipv6_hdr + sizeof(struct ipv6_hdr));
-			key->port_dst = rte_be_to_cpu_16(udp->dst_port);
-			key->port_src = rte_be_to_cpu_16(udp->src_port);
-			break;
-
-		default:
-			key->port_dst = 0;
-			key->port_src = 0;
-			break;
-	}
+	// delete hash
+	rte_hash_free(hash);
+	// delete data
+	rte_free(data);
 }
 
-void flowHash::makeIPKey(Poco::Net::IPAddress &src_ip, Poco::Net::IPAddress &dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t protocol, struct ip_5tuple *key)
+int FlowStorageIPV6::init(flow_storage_params_t *prm)
 {
-	if(src_ip.family() == Poco::Net::IPAddress::IPv4)
-	{
-		memset(key->ip_dst, 0, sizeof(key->ip_dst));
-		memset(key->ip_src, 0, sizeof(key->ip_src));
-		memcpy(key->ip_dst, dst_ip.addr(), 4);
-		memcpy(key->ip_src, src_ip.addr(), 4);
-		key->proto = protocol;
-
-		key->port_dst = rte_be_to_cpu_16(dst_port);
-		key->port_src = rte_be_to_cpu_16(src_port);
-	}
-	if(src_ip.family() == Poco::Net::IPAddress::IPv6)
-	{
-		rte_mov16(key->ip_dst, (const uint8_t*) dst_ip.addr());
-		rte_mov16(key->ip_src, (const uint8_t*) src_ip.addr());
-		key->proto = protocol;
-		key->port_dst = rte_be_to_cpu_16(dst_port);
-		key->port_src = rte_be_to_cpu_16(src_port);
-	}
+	if(short_alfs.init(prm->recs_number, prm->worker_id, en_alfs_short, prm->p_lifetime[0], 32))
+		return -1;
+	return long_alfs.init(prm->recs_number, prm->worker_id, en_alfs_long, prm->p_lifetime[1], 8);
 }
